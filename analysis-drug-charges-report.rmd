@@ -1,0 +1,1444 @@
+---
+title: "analysis-drug-charges"
+author: "Casey Toner"
+date: "AUTOFILL"
+output: pdf_document
+font_adjustment: +1
+always_allow_html: yes 
+---
+
+```{r, echo=FALSE, message=FALSE}
+library(RPostgreSQL)
+library(knitr)
+options(scipen=999,digits=2)
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, max.print = -1)
+# if we are in the reports directory, we are probably running
+# RStudio. Get the environmental settings. If we aren't, we are doing
+# something unusual and don't guess what to do.
+if (endsWith(getwd(), 'reports')) {
+    dotenv::load_dot_env('../.env')
+    }
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv,
+                     dbname="court_terminal",
+                 port="9000",
+                 host="localhost",
+                 user=Sys.getenv("PGUSER"),
+                 password=Sys.getenv("PGPASSWORD"))
+
+library(dplyr)
+library(tidyr)
+library(tidyverse) 
+library(ggplot2)
+```
+
+
+
+# Analysis of Cook County Drug Charges
+
+Our project aims to examine felony cases that are filed in municipal court but are dismissed before they can proceed to felony division.
+
+Let's begin by counting the possession of a controlled substance cases that have been filed in the municipal division since 2000.
+
+```{sql connection=con, output.var="municipal_contr_sub", echo=FALSE, cache = TRUE}
+
+SELECT COUNT(DISTINCT case_number), year
+      FROM ctoner.all_municipal_drug_cases
+      GROUP BY year
+```
+
+
+```{r}
+municipal_contr_sub <- municipal_contr_sub %>% arrange(year)
+controlled_sub_for_graph <- municipal_contr_sub %>% select(year,count)
+ggplot(controlled_sub_for_graph,aes(x=year,y=count)) + geom_bar(stat="identity") + theme_minimal()
+
+begin_count <- municipal_contr_sub$count[1]
+end_count <- municipal_contr_sub$count[length(municipal_contr_sub$count)]
+
+```
+This graph shows a significant decline in felony possession charges over the years, falling from a high of `r begin_count` charges in 2000 to `r end_count` charges in 2018.
+
+## Present cases
+
+Using data from the Cook County state's attorney's office, we can see possession cases that were filed as recently as September 2020. Unfortunately, the state's attorney's data does not allow us to determine in which phase the case was filed so we cannot isolate cases filed in the municipal division as easily. It just gives us total numbers. Here are cases since 2011, leading into the present.
+
+```{r}
+sa_possession_cases <- read_csv('sa_charges.csv')
+kable(sa_possession_cases,caption="Cook County State's Attorney possession cases")
+is.integer64 <- function(x){
+  class(x)=="integer64"
+}
+
+sa_possession_cases <- sa_possession_cases %>%
+  mutate_if(is.integer64, as.integer)
+ggplot(sa_possession_cases,aes(x=year,y=count)) + geom_bar(stat="identity") + scale_x_continuous(labels=as.character(sa_possession_cases$year),breaks=sa_possession_cases$year) + theme_minimal()
+```
+
+## Possession charges in criminal division
+
+Within 30 days of a possession of a controlled substance case being filed, a judge must find probable cause for it to proceed from the municipal division to the criminal division, barring grand jury indictments that accomplish the same feat. Determining the number of possession of controlled substance cases that are filed in the criminal division every year compared to municipal division will paint a rough picture of how many cases proceed.
+
+```{sql connection=con, output.var="crim_div_contr_sub", echo=FALSE, cache = TRUE}
+SELECT COUNT(case_number),  year
+      FROM ctoner.proceeding_drug_cases
+      GROUP BY year
+```
+
+```{r}
+mun_crim_div_counts <- crim_div_contr_sub %>%
+  select(crim_count=count,year) %>%
+  inner_join(municipal_contr_sub,by="year") %>%
+  select(year,crim_count,muni_count=count)
+
+proceeding_case_counts <- mun_crim_div_counts %>%
+  select(crim_count,muni_count) %>%
+  summarize(total_crim_charges=sum(crim_count),total_muni_charges=sum(muni_count)) %>% mutate(pct_proceed=((total_crim_charges/total_muni_charges)*100))
+
+proceeding_case_pct <- proceeding_case_counts$pct_proceed
+
+
+```
+
+Roughly `r proceeding_case_pct` % of felony drug cases proceed from municipal division to criminal division.
+
+## Case procession
+
+One way to check the methodology is to see if cases we identify as being dismissed nevertheless proceed into criminal court. That can be done by identifying booking numbers for drug cases in the municipal division and checking if those same booking numbers correlate to cases in the criminal division.
+
+```{sql connection=con, output.var="central_booking_number_check", echo=FALSE, cache = TRUE}
+ WITH events AS (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2, year
+      FROM docket_event de
+      JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+      JOIN court_case cc ON de.case_number = cc.case_number
+      JOIN disposition_codes dc ON dc.code = de.disposition_code
+      WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')),
+      
+proceeding_cases AS (
+   SELECT COUNT(DISTINCT events.max_cn) as terminated_cases, COUNT(DISTINCT pc.case_number) as proceeding_cases
+      FROM events
+      LEFT JOIN (SELECT pdc.case_number, e.central_booking_1, e.central_booking_2
+                 FROM ctoner.proceeding_drug_cases pdc
+                 JOIN events e ON pdc.central_booking_1 = e.central_booking_1) as pc
+      ON events.central_booking_1 = pc.central_booking_1
+     
+      )
+      
+   
+     
+SELECT * FROM proceeding_cases;
+
+```
+
+
+```{r}
+pct_proceeding <- with(central_booking_number_check, {
+    (proceeding_cases/terminated_cases) * 100
+})
+
+pct_proceeding <- round(pct_proceeding, digits=2)
+```
+
+Approximately `r pct_proceeding` % of cases we have identified as not proceeding in the criminal division did in fact proceed into the criminal division. This number can be reduced later on, but a small margin of error is good enough to confirm our general understanding of the drug case dismissal phenomenon.
+
+```{sql connection=con, output.var="proceeding_cases", echo=FALSE, cache = TRUE}
+--these are the events that occur in the final day of municipal division cases that proceed into the criminal division that we identify as not proceeding int the criminal division
+SELECT max_date,ncdc.max_cn,description FROM ctoner.non_continued_drug_cases ncdc JOIN docket_event de ON de.case_number = ncdc.max_cn AND de.date = ncdc.max_date JOIN disposition_codes dc ON dc.code = de.disposition_code JOIN ctoner.proceeding_drug_cases pdc ON pdc.central_booking_1 = ncdc.central_booking_1;
+  
+```
+
+```{r}
+final_events_on_dismissal_date <- proceeding_cases %>%
+  select(description) %>%
+  group_by(description) %>%
+  summarize(count=n()) %>%
+  arrange(-count)
+```
+
+## Portion of overall municipal division drug cases dismissed
+
+Four events indicate that a case is dismissed in the municipal division:"NON-SUIT","FINDING NO PROB CAUSE - DISMSD", "STRICKEN OFF - LEAVE REINSTATE" and 'NOLLE PROSEQUI.' At the municipal division, the the yearly breakdown of dismissed cases vs. overall controlled substances cases is as follows:
+
+```{sql connection=con, output.var="case_dismissed_counts_overall_counts", echo=FALSE, cache = TRUE}
+SELECT amdc.year, COUNT(DISTINCT amdc.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases 
+FROM (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2, year
+      FROM docket_event de
+      JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+      JOIN court_case cc ON de.case_number = cc.case_number
+      JOIN disposition_codes dc ON dc.code = de.disposition_code
+      WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events
+RIGHT JOIN ctoner.all_municipal_drug_cases amdc ON events.max_cn = amdc.case_number
+GROUP BY amdc.year
+ORDER BY amdc.year desc
+```
+
+```{r}
+graph_drug_info <- case_dismissed_counts_overall_counts %>%
+  mutate(pct_dismissed=(dismissed_cases/overall_drug_cases)*100)
+
+drugs_dismissed_pct <- case_dismissed_counts_overall_counts %>%
+  mutate(pct_dismissed=(dismissed_cases/overall_drug_cases)*100)
+
+only_pcts <- drugs_dismissed_pct$pct_dismissed
+
+avg_dismissed <- mean(only_pcts)
+
+median_dismissed <- median(only_pcts)
+
+highest_dismissal_pct <- max(only_pcts)
+
+lowest_dismissal_pct <- min(only_pcts)
+
+
+graph_drug_info_2 <- graph_drug_info %>% 
+  gather("drug_cases", "breakdown", 2:3) %>%
+  arrange(desc(drug_cases))
+
+graph_drug_info_2$drug_cases <- factor(graph_drug_info_2$drug_cases, levels = c('overall_drug_cases', 'dismissed_cases'))
+
+drug_case_dismissal_graph <- ggplot(graph_drug_info_2,aes(x=year,y=breakdown,fill=drug_cases)) + geom_bar(position="dodge",stat="identity") + scale_fill_manual(values=c("black", "red"))+
+  theme_minimal()
+
+drug_case_dismissal_graph
+
+```
+
+`r highest_dismissal_pct` % to `r lowest_dismissal_pct` % of controlled substance cases are dismissed in municipal division every year. An average of `r avg_dismissed` % of these cases were dismissed every year from 2000 to 2018.
+
+## Possession charges by race
+
+Using our race table, we can chart at the change in possession cases by race over time.
+
+```{sql connection=con, output.var="possession_cases_by_race", echo=FALSE, cache = TRUE}
+with race_ethnicity_cross as 
+    (SELECT ct.year, ct.case_number, 
+    CASE WHEN dt.race_mode = 'Black' or ccoms_race = 'Black' THEN 'Black'
+    WHEN dt.race_mode = 'White' or ccoms_race = 'White' THEN 'White'
+    WHEN dt.race_mode = 'Asian/Native' Then 'Asian/Native'
+    ELSE 'Other'
+End as race, 
+    CASE WHEN dt.ethnicity_mode = 'Latinx' or ccoms_latinx = 'Latinx' THEN 'Latinx'
+    WHEN dt.race_mode = 'Not' or ccoms_race = 'Not' THEN 'Not'
+ELSE 'Not'
+End as ethnicity
+From ctoner.all_municipal_drug_cases ct
+    RIGHT JOIN ir_cluster c ON ct.case_number = c.case_number
+    JOIN defendant_table1 dt USING (cluster_id)
+    JOIN docket_charge d ON ( d.case_number = ct.case_number )
+    WHERE ct.year between 2000 and 2018
+    GROUP BY ct.year, ct.case_number, c.cluster_id, dt.race_mode, dt.ethnicity_mode, dt.ccoms_race, dt.ccoms_latinx)
+SELECT year, race,
+    SUM(CASE WHEN ethnicity = 'Latinx' then 1 else 0 end) AS Latinx,
+    SUM(CASE WHEN ethnicity = 'Not' then 1 else 0 end) AS NotLatinx,
+     COUNT(*) AS total
+From race_ethnicity_cross
+    GROUP BY race, year
+    ORDER BY year ASC;
+
+```
+
+```{r}
+#isolate latinx cases, join with other race data 
+
+latinx <- possession_cases_by_race %>% select(year,count=latinx) %>% group_by(year) %>% summarize(count=sum(count))
+
+latinx$race <- "latinx"
+
+possession_race_graph <- possession_cases_by_race %>% select(year,race,count=total) %>% arrange(year)
+
+possession_race_graph_non_black <- possession_race_graph %>% filter(race != "Black")
+
+possession_race_black <- possession_race_graph %>% filter(race == "Black")
+
+black_charges_2000 <- possession_race_black$count[1]
+
+black_charges_2018 <- possession_race_black$count[length(possession_race_black$count)]
+
+latinx_graph <- ggplot(latinx,aes(x=year,y=count)) + geom_line()
+
+all_races <- ggplot(possession_race_graph,aes(x=year,y=count,color=race)) + geom_line()
+
+non_black <- ggplot(possession_race_graph_non_black,aes(x=year,y=count,color=race)) + geom_line()
+
+all_races
+
+
+```
+Black defendants make up an overwhelming number of possession cases, falling from a high of `r black_charges_2000` in 2000 to `r black_charges_2018` in 2018. Similarly, non-black defendants have seen a decrease in possession charges.
+
+```{r}
+non_black
+```
+
+This is how charges for Latinx defendants line up over the years.
+
+```{r}
+latinx_graph
+```
+
+
+## Drug charge dismissal by race
+
+Our race data is incomplete, but let's see if there are any differences between charging dismissal rates between black defendants and non-black defendants.
+
+```{sql connection=con, output.var="case_dismissed_counts_race", echo=FALSE, cache = TRUE}
+SELECT mdcrt.year, agency_name, race AS race_cat, COUNT(DISTINCT mdcpr.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM ctoner.municipal_drug_cases_police_race mdcpr
+      JOIN ctoner.municipal_drug_charge_race_table mdcrt USING (case_number)
+      LEFT JOIN (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2
+                 FROM docket_event de
+                 JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+                 JOIN court_case cc ON de.case_number = cc.case_number
+                 JOIN disposition_codes dc ON dc.code = de.disposition_code
+                 WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events ON case_number = events.max_cn
+                 WHERE mdcrt.year between 2010 and 2018
+GROUP BY mdcrt.year,agency_name, race
+ORDER BY mdcrt.year desc
+```
+
+```{r,  results = 'asis'}
+case_dismissed_counts_race <- case_dismissed_counts_race %>%
+  filter(!is.na(case_dismissed_counts_race))
+
+race_pct <- case_dismissed_counts_race %>%
+  select(race_cat, dismissed_cases,overall_drug_cases) %>%
+  group_by(race_cat) %>%
+  summarize(dismissed_cases=sum(dismissed_cases),overall_cases=sum(overall_drug_cases)) %>%
+  group_by(race_cat) %>% 
+  mutate(pct_dismissed=(dismissed_cases/overall_cases)*100)
+
+race_pct$pct_of_cases <- race_pct$overall_cases/sum(race_pct$overall_cases)
+
+race_pct$pct_of_cases <- race_pct$pct_of_cases*100
+
+race_pct_table <- race_pct[,c("race_cat","pct_of_cases")]
+
+race_pct_table <- race_pct_table[order(race_pct_table$pct_of_cases,decreasing=TRUE),]
+
+race_table <- race_pct %>% 
+  select(race=race_cat,dismissed_cases,overall_cases,pct_dismissed) %>% arrange(-overall_cases)
+
+
+
+```
+
+```{r,  results = 'asis'}
+black_pct <- race_pct_table[race_pct_table$race_cat == 'Black', 'pct_of_cases']
+white_pct <- race_pct_table[race_pct_table$race_cat == 'White', 'pct_of_cases']
+other_pct <- race_pct_table[race_pct_table$race_cat == 'Other', 'pct_of_cases']
+asian_pct <- race_pct_table[race_pct_table$race_cat == 'Asian/Native', 'pct_of_cases']
+
+drug_case_by_race <- race_table %>% select(race,dismissed_cases,overall_cases)
+
+drug_case_by_race_2 <- drug_case_by_race %>% 
+  gather("case_type", "counts", 2:3) 
+
+drug_case_by_race_2$case_type <- factor(drug_case_by_race_2$case_type, levels = c('overall_cases', 'dismissed_cases'))
+drug_case_by_race_2$race <- factor(drug_case_by_race_2$race, levels = c('Black', 'White', 'Other','Asian/Native'))
+
+ ggplot(drug_case_by_race_2,aes(x=race,y=counts,fill=case_type)) + geom_bar(position="dodge",stat="identity") + scale_fill_manual(values=c("black", "red")) +
+  theme_minimal()
+```
+
+
+
+```{sql connection=con, output.var="latinx_case_dismissed_counts_race", echo=FALSE, cache = TRUE}
+SELECT ethnicity, COUNT(DISTINCT mdcrt.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM ctoner.municipal_drug_charge_race_table mdcrt
+      LEFT JOIN (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2
+                 FROM docket_event de
+                 JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+                 JOIN court_case cc ON de.case_number = cc.case_number
+                 JOIN disposition_codes dc ON dc.code = de.disposition_code
+                 WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events ON case_number = events.max_cn
+                 WHERE mdcrt.year between 2010 and 2018
+GROUP BY ethnicity
+ORDER BY overall_drug_cases desc
+```
+
+```{r, results='Asis'}
+latinx_case_dismissed_counts_race <- latinx_case_dismissed_counts_race %>% mutate(ethnicity = recode(ethnicity, "Not" = "Not-Latinx"))
+
+latinx_case_dismissed_counts_race_table <- latinx_case_dismissed_counts_race %>% group_by(ethnicity) %>% mutate(dismissal_rate_pct=((dismissed_cases/overall_drug_cases)*100))
+
+kable(latinx_case_dismissed_counts_race_table,caption="breakdown of drug cases by ethnicity")
+
+total_cases_for_latinx <- latinx_case_dismissed_counts_race %>%
+  summarize(total_cases=sum(overall_drug_cases))
+
+latin_x_percent <- (latinx_case_dismissed_counts_race$overall_drug_cases[2]/total_cases_for_latinx)*100
+
+latinx_graph <- latinx_case_dismissed_counts_race %>% gather("case_type","breakdown",2:3)
+
+latinx_graph$case_type <- factor(latinx_graph$case_type, levels = c('overall_drug_cases', 'dismissed_cases'))
+latinx_graph$ethnicity <- factor(latinx_graph$ethnicity, levels = c('Not-Latinx', 'Latinx'))
+
+
+ ggplot(latinx_graph,aes(x=ethnicity,y=breakdown,fill=case_type)) + geom_bar(position="dodge",stat="identity") + scale_fill_manual(values=c("black", "red")) +
+  theme_minimal()
+
+```
+
+
+Black defendants, who make up about 23 percent of all people in Cook County according to the most recent census, represented `r black_pct` % of possession of a controlled substance charges. White defendants represented `r white_pct` % of drug charges, Asian and Native defendants `r asian_pct` %, and all others `r other_pct` %. Approximately `r latin_x_percent` percent of drug cases are for Latinx defendants.
+
+The difference in dismissal rates between different races and ethnicities of defendants seems negligible.
+
+## Gun charges vs drug charges in municipal division
+
+For comparison, let's examine the fate of unlawful use of a weapon charges filed in municipal division. But unlike drug charges, felony gun charges are first reviewed by the state's attorneys office prior to being filed.
+
+```{sql connection=con, output.var="weapons_dismissed_counts_overall_counts", echo=FALSE, cache = TRUE}
+SELECT gun_cases.year, COUNT(DISTINCT gun_cases.case_number) AS overall_gun_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+FROM (SELECT * FROM ctoner.agg_unlawful_weapon_dismissed auwd
+JOIN docket_event de ON de.case_number = auwd.max_cn
+JOIN disposition_codes dc ON dc.code = de.disposition_code
+WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) dismissed_cases
+      RIGHT JOIN
+      (SELECT case_number, year
+      FROM ctoner.agg_unlawful_weapon_charges) as gun_cases
+      ON dismissed_cases.max_cn = gun_cases.case_number
+      GROUP BY gun_cases.year
+   ORDER BY gun_cases.year DESC
+
+```
+
+```{r}
+weapons_dismissed_pct <- weapons_dismissed_counts_overall_counts %>% mutate(pct_dismissed=(dismissed_cases/overall_gun_cases)*100)
+
+only_pcts <- with(weapons_dismissed_counts_overall_counts, {
+    (dismissed_cases/overall_gun_cases) * 100
+})
+
+
+avg_gun_dismissed <- mean(only_pcts)
+
+median_gun_dismissed <- median(only_pcts)
+
+high_dismissal_rate_for_gun_charges <- max(only_pcts)
+
+low_dismissal_rate_for_gun_charges <- min(only_pcts)
+
+
+difference <- avg_dismissed - avg_gun_dismissed
+
+gun_bar_graph <- weapons_dismissed_counts_overall_counts %>%
+  gather("gun_case_breakdown","counts",2:3)
+
+gun_line_graph <- weapons_dismissed_pct %>% gather("gun_cases","breakdown",2:3) %>%
+  filter(gun_cases == "dismissed_cases") %>%
+  mutate(charge_pct=recode(gun_cases,"dismissed_cases"="dismissed_gun_case_pct")) %>%
+  select(year,pct_dismissed,charge_pct)
+ 
+drug_line_graph <- graph_drug_info_2 %>% filter(drug_cases == "dismissed_cases") %>%
+  mutate(charge_pct=recode(drug_cases,"dismissed_cases"="dismissed_drug_cases")) %>%
+  select(year,pct_dismissed,charge_pct)
+
+drug_and_gun_graph <- union(gun_line_graph,drug_line_graph)
+
+gun_bar_graph$gun_case_breakdown <- factor(gun_bar_graph$gun_case_breakdown, levels = c('overall_gun_cases', 'dismissed_cases'))
+
+ggplot(gun_bar_graph,aes(x=year,y=counts,fill=gun_case_breakdown)) +
+  geom_bar(position="dodge",stat="identity") +
+  scale_fill_manual(values=c("black", "red")) +
+  theme_minimal()
+
+drug_case_dismissal_graph
+
+ggplot(drug_and_gun_graph,aes(x=year,y=pct_dismissed,color=charge_pct)) + geom_line() 
+
+
+
+
+```
+These two bar graphs show the difference in gun cases and drug cases that are filed and dismissed in municipal division from 2000 to 2018. The line graph shows the percentage of drug and gun cases that are dismissed from municipal division every year.
+
+In short, `r low_dismissal_rate_for_gun_charges` % to `r high_dismissal_rate_for_gun_charges` % of gun charges were dismissed in municipal division every year from 2000 to 2018, an average of `r avg_gun_dismissed` %.
+
+Drug charges are `r difference` % more likely to be dismissed in municipal division than gun charges. For the most part, there are more drug cases dismissed every year than there are gun charges.
+
+# Drug possession vs intent to deliver rates
+
+How do dismissal rates vary between possession charges, and intent to deliver charges? To gauge the differences, this analysis counts and then determines the dismissal rate the top three most frequently charged controlled substance crimes: possession of controlled substance, manufacture of controlled substance, and delivery to persons under 18.
+
+```{sql connection=con, output.var="possession_intent", echo=FALSE, cache = TRUE}
+
+SELECT drug_cases.year, crime_description, COUNT(DISTINCT drug_cases.case_number) AS overall_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+FROM (SELECT * FROM ctoner.non_continued_all_drug_cases ncadc
+     JOIN docket_event de ON max_cn = de.case_number
+     JOIN disposition_codes dc ON dc.code = de.disposition_code
+     WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as ncadc
+RIGHT JOIN (SELECT DISTINCT ON(case_number) case_number, year, ucr.description as crime_description
+                  FROM court_case cc
+                  JOIN docket_charge using (case_number)
+                  JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+                  JOIN ucr on ucr_id = ucr.id
+                  WHERE division = 'municipal' AND year between 2000 and 2018 and offense_category in ('Controlled Substances Act') and docket_charge.count = '001')       as drug_cases ON ncadc.max_cn = drug_cases.case_number
+      GROUP BY drug_cases.year, crime_description
+      ORDER BY drug_cases.year desc;
+
+```
+
+```{r, results = 'asis'}
+top_drug_charges <- possession_intent %>%
+  select(crime_description,overall_cases,dismissed_cases) %>%
+  group_by(crime_description) %>%
+  summarize(total_cases=sum(overall_cases),total_dismissed_cases=sum(dismissed_cases)) %>%
+  select(crime_description,total_cases,total_dismissed_cases) %>%
+  arrange(-total_cases) %>%
+  group_by(crime_description) %>%
+  mutate(pct_dismissed=(total_dismissed_cases/total_cases)*100) %>%
+  top_n(3)
+
+top_drug_charges_kable_chart <- top_drug_charges %>%
+  select(drug_crime=crime_description,total_cases,pct_dismissed)
+
+number_of_possession_cases <- top_drug_charges$total_cases[1]
+possession_dismiss_rate <- top_drug_charges$pct_dismissed[1] 
+
+##using round
+possession_dismiss_rate <- round(possession_dismiss_rate, digits=2)
+
+manufacture_dismiss_rate <- top_drug_charges$pct_dismissed[2]
+
+manufacture_dismiss_rate <- round(manufacture_dismiss_rate,digits=2)
+
+delivery_dismiss_rate <- top_drug_charges$pct_dismissed[3]
+
+delivery_dismiss_rate <- round(delivery_dismiss_rate,digits=2)
+
+top_three_drug_charges <- possession_intent %>% filter(crime_description %in% c("Possession of Controlled Substance","Manufacture of Controlled Substance","Delivery to Persons Under 18")) %>% mutate(pct_dismissed=((dismissed_cases/overall_cases)*100))
+
+overall_drug_charges <- top_three_drug_charges %>% select(year,crime_description,overall_cases)
+
+drug_charges_graph <- top_three_drug_charges %>% select(year,crime_description,pct_dismissed)
+
+kable(top_drug_charges_kable_chart, caption = "Drug charge counts")
+
+ggplot(overall_drug_charges,aes(x=year,y=overall_cases,color=crime_description)) + geom_line()
+
+```
+Possession of Controlled Substance, with `r number_of_possession_cases` cases, has more than six times the number of cases of the second most popular drug charge: Manufacture of Controlled Substance. 
+
+```{r}
+ggplot(drug_charges_graph,aes(x=year,y=pct_dismissed,color=crime_description)) + geom_line() + geom_point()
+```
+
+
+Overall, `r possession_dismiss_rate` % of possession cases were dismissed in preliminary hearings compared to `r manufacture_dismiss_rate` % percent of manufacturing cases and `r delivery_dismiss_rate` % of delivery to persons under 18 cases.
+
+# Police department drug dismissal rates
+
+Each police agency has its own arrest rates and dismissal rates for possession charges, which can vary based on population, crime rates, and crime enforcement. Using American Community Survey census estimates for the years 2010 through 2019 and Chicago Police Department district [population estimates from 2010](https://johnkeefe.net/chicago-race-and-ethnicity-data-by-police-district), this analysis examines per capita possession charge and dismissal rates by police agency.
+
+```{sql connection=con, output.var="case_dismissed_rates_by_agency_chicago_together", echo=FALSE, cache = TRUE}
+      -------------------------THIS QUERY GROUPS ALL CHICAGO POLICE AGENCIES AND DISTRICTS INTO ONE -------------------------
+      SELECT drug_cases.year, drug_cases.agency_name, COUNT(DISTINCT drug_cases.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2, year
+      FROM docket_event de
+      JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+      JOIN court_case cc ON de.case_number = cc.case_number
+      JOIN disposition_codes dc ON dc.code = de.disposition_code
+      WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events
+      RIGHT JOIN (SELECT DISTINCT ON(case_number) case_number, year, CASE
+      WHEN agency_name IN (
+      'CHICAGO(10TH) MARQU',
+      'CHICAGO(11TH) FILLM',
+      'CHICAGO(12TH) MONRO',
+      'CHICAGO(13TH) WOOD',
+      'CHICAGO(14TH) SHAKE',
+      'CHICAGO(15TH) AUSTI',
+      'CHICAGO(16TH) IRVIN',
+      'CHICAGO(17TH) ALBAN',
+      'CHICAGO(18TH) EAST',
+      'CHICAGO(19TH) TOWN',
+      'CHICAGO(1ST) CENTRA',
+      'CHICAGO(20TH) SUMME',
+      'CHICAGO(21ST) PRAIR',
+      'CHICAGO (22ND) DIST',
+      'CHICAGO (23RD) DIST',
+      'CHICAGO (24) DIST 2',
+      'CHICAGO (25TH) DIST',
+      'CHICAGO(2ND) WABASH',
+      'CHICAGO(3RD) GRAND',
+      'CHICAGO(4TH) SOUTH',
+      'CHICAGO(5TH) KENSIN',
+      'CHICAGO(6TH) GRESHA',
+      'CHICAGO(7TH) ENGLEW',
+      'CHICAGO(8TH) CHICAG',
+      'CHICAGO(9TH) DEERIN',
+      'CHICAGO POLICE DEPT',
+      'VICE CONTROL SECTIO',
+      'GANG CRIMES NORTH',
+      'NARCOTICS SECTION',
+      'GANG CRIMES SOUTH',
+      'GANG CRIMES WEST',
+      'PUBLIC HOUSING NORT',
+      'PUBLIC TRANS SECTIO',
+      'PUBLIC HOUSING SOUT')
+         THEN 'CHICAGO'
+      WHEN agency_name = 'OAK FOREST PD' THEN 'OAK FOREST'
+      WHEN agency_name = 'SOUTH CHICAGO HEIGH' THEN 'SOUTH CHICAGO HEIGHTS'
+      WHEN agency_name = 'EAST HAZELCREST' THEN 'EAST HAZEL CREST'
+      WHEN agency_name = 'HAZELCREST' THEN 'HAZEL CREST'
+      WHEN agency_name = 'LAGRANGE' THEN 'LA GRANGE'
+      WHEN agency_name = 'LAGRANGE PARK' THEN 'LA GRANGE PARK'
+      ELSE agency_name
+      END AS agency_name
+      FROM raw_mcase
+      JOIN court_case cc USING (case_number)
+      JOIN docket_charge using (case_number)
+      JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+      JOIN ucr on ucr_id = ucr.id
+      WHERE division = 'municipal' AND year between 2010 and 2018 and ucr.description = 'Possession of Controlled Substance' and docket_charge.count = '001') as drug_cases ON events.max_cn = drug_cases.case_number
+      GROUP BY drug_cases.year,drug_cases.agency_name
+ORDER BY drug_cases.year desc;
+```
+
+
+```{sql connection=con, output.var="case_dismissed_rates_by_agency_chicago_apart", echo=FALSE, cache = TRUE}
+---this looks at the case dismissal rates, but keeps the Chicago police districts distinct
+SELECT drug_cases.year, drug_cases.agency_name, COUNT(DISTINCT drug_cases.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2, year
+            FROM docket_event de
+            JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+            JOIN court_case cc ON de.case_number = cc.case_number
+            JOIN disposition_codes dc ON dc.code = de.disposition_code
+            WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events
+      RIGHT JOIN (SELECT * FROM ctoner.municipal_drug_cases_police_race WHERE year between 2010 and 2018) as drug_cases ON events.max_cn = drug_cases.case_number
+GROUP BY drug_cases.year,drug_cases.agency_name
+ORDER BY drug_cases.year desc;
+
+```
+
+
+```{r}
+by_dept_dismissed_rate_overall <- case_dismissed_rates_by_agency_chicago_together %>%
+  select(agency_name, dismissed_cases,overall_drug_cases) %>%
+  group_by(agency_name) %>%
+  summarize(dismissed_cases=sum(dismissed_cases),overall_drug_cases=sum(overall_drug_cases)) %>% mutate(pct_dismissed=(dismissed_cases/overall_drug_cases)*100) %>%
+  filter(overall_drug_cases >= 100) %>%
+  arrange(-pct_dismissed)
+
+##filter out 2009 for dismissal rate and departments where there are fewer than 90 possession cases
+by_dept_dismissed_rate_2010_on <- case_dismissed_rates_by_agency_chicago_together %>%
+  filter(year != 2009) %>%
+  select(agency_name, dismissed_cases,overall_drug_cases) %>%
+  group_by(agency_name) %>%
+  summarize(dismissed_cases=sum(dismissed_cases),overall_drug_cases=sum(overall_drug_cases)) %>% mutate(pct_dismissed=(dismissed_cases/overall_drug_cases)*100) %>%
+  filter(overall_drug_cases >= 90) %>%
+  arrange(-pct_dismissed)
+```
+
+```{r}
+illinois_population_2010_2019 <- read_csv('~/court_analysis/analysis-drug-charges/reports/all_illinois_places.csv')
+
+## prepare_for_joining_census_data
+illinois_population_data <- illinois_population_2010_2019 %>%
+  select(agency_name=town_upper,year,population)
+
+population_drug_cases_by_year <- case_dismissed_rates_by_agency_chicago_together %>% 
+  filter(year != "2009") %>%
+  left_join(illinois_population_data, by=c("year","agency_name"))
+
+
+##create averages for population, drug arrests, dismissed cases from 2010 to 2018
+avg_drug_pop_data_decade <- population_drug_cases_by_year %>%
+  select(agency_name,overall_drug_cases,dismissed_cases,population) %>%
+  group_by(agency_name) %>%
+  summarize(avg_drug_cases_2010_2018=mean(overall_drug_cases),avg_dismissed_cases_2010_2018=mean(dismissed_cases),avg_pop_2010_2018=mean(population),total_drug_cases_2010_2018=sum(overall_drug_cases)) %>%
+  select(agency_name, total_drug_cases_2010_2018, avg_drug_cases_2010_2018, avg_dismissed_cases_2010_2018,avg_pop_2010_2018)
+
+
+```
+
+
+```{r}
+#calculate per_capita
+drug_per_capita_rates <- avg_drug_pop_data_decade %>%
+  mutate(per_capita_drug_cases=((avg_drug_cases_2010_2018/avg_pop_2010_2018)*100000)) %>%
+  mutate(per_capita_dismissed_cases=((avg_dismissed_cases_2010_2018/avg_pop_2010_2018)*100000)) %>% select(agency_name,total_drug_cases_2010_2018,avg_drug_cases_2010_2018, avg_pop=avg_pop_2010_2018,per_capita_drug_cases,per_capita_dismissed_cases) %>%
+  filter(avg_drug_cases_2010_2018 > 10) %>%
+  left_join(by_dept_dismissed_rate_2010_on, by ="agency_name") %>%
+  select(agency_name,avg_pop,avg_drug_cases_2010_2018,total_drug_cases_2010_2018,per_capita_drug_cases,per_capita_dismissed_cases,pct_dismissed)
+
+##calculate chicago drug cases vs. everywhere else with more an avg of 10 cases a year
+drug_cases_chicago <- drug_per_capita_rates %>%
+  filter(agency_name == 'CHICAGO') %>%
+  select(total_drug_cases_2010_2018)
+
+drug_cases_outside_chicago <- drug_per_capita_rates %>%
+  filter(agency_name != 'CHICAGO') %>%
+  select(total_drug_cases_2010_2018) %>%
+  summarize(non_chicago_cases=sum(total_drug_cases_2010_2018))
+
+
+```
+
+For reference, there were `r drug_cases_chicago` drug cases in Chicago and `r drug_cases_outside_chicago` outside Chicago from 2010 to 2018, meaning that Chicago police are responsible for most drug cases in Cook County. More than a third of all drug cases came from these three Chicago police districts:
+
+```{r,results='asis'}
+### see total cases by agency 
+charge_totals_by_agency_no_year <- case_dismissed_rates_by_agency_chicago_apart %>% select(agency_name,dismissed_cases,overall_drug_cases) %>% group_by(agency_name) %>% summarize(total_dismissed_cases=sum(dismissed_cases),total_overall_cases=sum(overall_drug_cases)) %>% arrange(-total_overall_cases)
+
+total_drug_cases <- charge_totals_by_agency_no_year %>%
+  select(total_overall_cases) %>%
+  summarize(total_cases=sum(total_overall_cases))
+
+charge_totals_by_agency_no_year$total_cases <- total_drug_cases
+
+half_of_drug_cases <- charge_totals_by_agency_no_year %>%
+  mutate(pct_of_cases=(total_overall_cases/total_cases)*100) %>% select(agency_name,total_dismissed_cases,total_overall_cases,pct_of_cases) %>%
+  top_n(3)
+
+kable(half_of_drug_cases,caption='top three charging police agencies for drug crimes')
+```
+
+
+```{r}
+### calculate drug possession case totals and case dismissal pct by police agency with chicago districts broken out
+agency_totals <- case_dismissed_rates_by_agency_chicago_apart %>%
+  select(agency_name,year,dismissed_cases,overall_drug_cases) %>%
+  group_by(agency_name,year) %>%
+  mutate(pct_dismissed=((dismissed_cases/overall_drug_cases)*100)) %>%
+  group_by(agency_name) %>%
+  summarize(avg_drug_cases_2010_2018=mean(overall_drug_cases),total_dismissals_by_agency=mean(dismissed_cases),pct_dismissed=mean(pct_dismissed))
+
+
+```
+
+```{r}
+### enter in chicago police district population information
+chicago_district_population <- read_csv(col_types = cols(dist_num = col_character() ),'~/court_analysis/analysis-drug-charges/reports/cpd_population.csv')
+### group by district for population, calculate percentage of black residents per district
+chi_pop_totals <- chicago_district_population %>%
+  select(agency_name=dist_num,population=P003001) %>%
+  group_by(agency_name) %>%
+  summarize(total_pop=sum(population))
+
+chi_pop_totals_black_pct <- chicago_district_population %>%
+  select(agency_name=dist_num,population=P003001,black_population=P003003) %>%
+  group_by(agency_name) %>% summarize(total_pop=sum(population),total_black_population=sum(black_population)) %>%
+  mutate(black_pct=(total_black_population/total_pop)*100)
+
+
+##join Chicago district populations with total charges
+
+CPD_district_identifier <- c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25")
+
+
+chi_district_totals_with_pop <- agency_totals %>%
+  left_join(chi_pop_totals,by="agency_name") %>%
+  filter(agency_name %in% CPD_district_identifier) %>%
+  select(agency_name,avg_drug_cases_2010_2018,total_dismissals_by_agency,total_pop,pct_dismissed) %>%
+  mutate(per_capita_drug_charges=((avg_drug_cases_2010_2018/total_pop)*100000)) %>%
+  select(agency_name,total_pop,avg_drug_cases_2010_2018,pct_dismissed,per_capita_drug_charges)
+
+
+### combine with non-Chicago towns
+
+non_district_charges <- drug_per_capita_rates %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  select(agency_name,total_pop=avg_pop,avg_drug_cases_2010_2018,pct_dismissed,per_capita_drug_charges=per_capita_drug_cases)
+
+chi_districts_all_agencies_per_capita <- union(non_district_charges,chi_district_totals_with_pop)
+```
+
+
+```{r}
+write_csv(chi_districts_all_agencies_per_capita, '~/Desktop/all_agencies_per_capita_rates.csv')
+```
+
+The top 10 Chicago police districts agencies with the highest drug possession cases per capita:
+
+```{r, results='asis'}
+
+suburban_per_capita <- chi_districts_all_agencies_per_capita %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-per_capita_drug_charges) %>%
+  top_n(10) %>%
+  select(agency_name,total_pop,per_capita_possession_charges=per_capita_drug_charges)
+
+city_per_capita <- chi_districts_all_agencies_per_capita %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-per_capita_drug_charges) %>%
+  top_n(10) %>%
+  select(agency_name,total_pop,per_capita_possession_charges=per_capita_drug_charges)
+
+
+kable(city_per_capita , caption="possession cases per capita in Chicago")
+
+```
+
+The top 10 suburban police agencies with the highest drug possession cases per capita. 
+
+```{r, results='asis'}
+kable(suburban_per_capita , caption="possession cases per capita in Chicago")
+```
+
+The top 10 Chicago police districts with the highest dismissal rates for drug possession cases.
+
+```{r, results='asis'}
+
+all_chicago_dist <- chi_districts_all_agencies_per_capita %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-pct_dismissed) %>%
+  select(agency_name,pct_dismissed,per_capita_drug_charges)
+
+all_suburban_dist <- chi_districts_all_agencies_per_capita %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-pct_dismissed) %>%
+  select(agency_name,pct_dismissed,per_capita_drug_charges)
+
+write_csv(all_chicago_dist,'~/court_analysis/analysis-drug_data_check/reports/all_chicago_dismissal.csv')
+
+write_csv(all_suburban_dist,'~/court_analysis/analysis-drug_data_check/reports/all_suburban_dismissal.csv')
+
+
+chicago_dismised_by_agency <- chi_districts_all_agencies_per_capita %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-pct_dismissed) %>%
+  top_n(10) %>%
+  select(agency_name,pct_dismissed,per_capita_drug_charges)
+
+suburbs_dismissed_by_agency <- chi_districts_all_agencies_per_capita %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-pct_dismissed) %>%
+  top_n(10) %>%
+  select(agency_name,pct_dismissed,per_capita_drug_charges)
+
+kable(chicago_dismised_by_agency, caption="case dismissals by Chicago district")
+
+
+```
+
+The top 10 suburban police agencies with the highest dismissal rates for drug possession cases.
+
+```{r,results='asis'}
+kable(suburbs_dismissed_by_agency, caption="case dismissals by suburban agency")
+```
+
+## Racial analysis of possession charges by agency
+
+Our earlier analysis showed that black people are disproportionately prosecuted for drug crimes. Now's let's see how this breaks down for each police agency by using census records to contrast the racial makeup of municipalities or police districts with those charged with possession crimes.
+
+```{sql connection=con, output.var="case_dismissed_rates_by_agency_race", echo=FALSE, cache = TRUE}
+SELECT mdcrt.year, agency_name, race AS race_cat, COUNT(DISTINCT mdcpr.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM ctoner.municipal_drug_cases_police_race mdcpr
+      JOIN ctoner.municipal_drug_charge_race_table mdcrt USING (case_number)
+      LEFT JOIN (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2
+                 FROM docket_event de
+                 JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+                 JOIN court_case cc ON de.case_number = cc.case_number
+                 JOIN disposition_codes dc ON dc.code = de.disposition_code
+                 WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events ON case_number = events.max_cn
+                 WHERE mdcrt.year between 2010 and 2018
+GROUP BY mdcrt.year,agency_name, race
+ORDER BY mdcrt.year desc
+
+```
+
+
+
+```{r}
+#create census race data object
+race_census_data <- read_csv('~/court_analysis/analysis-drug-charges/reports/all_illinois_places_race_data_2010_2019.csv')
+
+race_census_data <- race_census_data %>%
+  select(year=Year,agency_name=Municipal_name,black_population=`Estimate!!Total!!Population of one race!!Black or African American`,population=`Estimate!!Total`) %>%
+  filter(year != 2019) %>%
+  mutate(pct_black=((black_population/population)*100),na.rm = TRUE)
+
+
+chicago_pop_data <- chi_pop_totals_black_pct %>%
+  select(agency_name,population=total_pop,black_population=total_black_population,pct_black=black_pct)
+
+```
+
+```{r}
+#find sum of total cases
+total_cases <- case_dismissed_rates_by_agency_race %>%
+  group_by(year,agency_name) %>%
+  summarize(total_cases=sum(overall_drug_cases))
+
+#use sum of total_cases, create percentages
+
+case_dismissed_rates_by_agency_pct <- case_dismissed_rates_by_agency_race %>%
+  inner_join(total_cases,by=c("year","agency_name")) %>%
+  mutate(race_pct=((overall_drug_cases/total_cases)*100))
+
+
+clean_race_census_data <- race_census_data %>%
+  right_join(case_dismissed_rates_by_agency_pct,by=c("year","agency_name"))
+```
+
+```{r}
+
+#calculate total cases, cases as a percentage of race
+
+case_dismissed_rates_by_agency_race <- case_dismissed_rates_by_agency_race %>%
+  group_by(year,agency_name) %>%
+  mutate(total_cases_by_agency=sum(overall_drug_cases)) %>%
+  mutate(pct_race=((overall_drug_cases/total_cases_by_agency)*100))
+
+#create object of total cases
+
+distinct_total_cases <- case_dismissed_rates_by_agency_race %>% select(year,agency_name,total_cases_by_agency) %>% group_by(year,agency_name,total_cases_by_agency) %>% distinct()
+
+#spread dismissed, overall cases by race
+
+dismissed_overall_cases <- case_dismissed_rates_by_agency_race %>%
+  pivot_wider(names_from = race_cat, 
+    values_from=c('overall_drug_cases', 'dismissed_cases','pct_race'),
+    values_fill = 0) %>% 
+  select(agency_name,
+         year,
+         -total_cases_by_agency,
+         overall_black_cases=overall_drug_cases_Black,
+         overall_white_cases=overall_drug_cases_White,
+         overall_other_cases=overall_drug_cases_Other,
+         overall_asian_native_cases=`overall_drug_cases_Asian/Native`,
+         dismissed_black_cases=dismissed_cases_Black,
+         dismissed_white_cases=dismissed_cases_White,
+         dismissed_other_cases=dismissed_cases_Other,
+         dismissed_asian_native_cases=`dismissed_cases_Asian/Native`,
+         pct_race_black=pct_race_Black,
+         pct_race_white=pct_race_White,
+         pct_race_other=pct_race_Other,
+         pct_race_asian_native=`pct_race_Asian/Native`)
+
+         
+
+#join spread overall cases, spread dismissal cases, total cases, remove NAs
+
+spread_totals <- dismissed_overall_cases %>% 
+  inner_join(distinct_total_cases,by=c("year","agency_name"))
+spread_totals[is.na(spread_totals)] = 0
+
+```
+
+
+```{r}
+#show charging statistics by race
+
+totals <- case_dismissed_rates_by_agency_race %>%
+  group_by(race_cat) %>% 
+  summarize(overall_drug_charges=sum(overall_drug_cases),
+            total_dismissed_cases=sum(dismissed_cases)) 
+
+totals$total_cases <- sum(totals$overall_drug_charges)
+
+totals_by_race <- totals %>%
+  group_by(race_cat) %>% 
+  mutate(pct_of_case_by_race=((overall_drug_charges/total_cases)*100),
+        race_dismissal_pct=((total_dismissed_cases/overall_drug_charges)*100)) %>% 
+  arrange(-pct_of_case_by_race) 
+
+pct_of_all_cases_black <- totals_by_race$pct_of_case_by_race[1]
+
+black_dismissed_pct <- totals_by_race$race_dismissal_pct[1]
+
+white_dismissed_pct <- totals_by_race$race_dismissal_pct[2]
+```
+
+
+```{r}
+
+#join census data to race arrest data
+clean_race_census_data <- race_census_data %>%
+  right_join(spread_totals,by=c("year","agency_name")) %>% select(-`na.rm`)
+
+cpd_data_black <- clean_race_census_data %>%
+  filter(agency_name %in% CPD_district_identifier)
+
+
+cpd_data_black <- cpd_data_black %>%
+  inner_join(chicago_pop_data,by="agency_name") %>%
+  select(-population.x,
+         -pct_black.x,
+         population=population.y,
+         pct_black=pct_black.y,
+         black_population=black_population.y,
+         -black_population.x)
+
+black_arrest_and_census_data <- clean_race_census_data %>%
+   filter(!agency_name %in% CPD_district_identifier) %>%
+  union(cpd_data_black) %>% 
+  group_by(year,agency_name) %>%
+  mutate(pct_black_dismissed_cases=((dismissed_black_cases/overall_black_cases)*100))
+
+## create averages
+
+pct_black_avg <- black_arrest_and_census_data %>%
+  select(-year) %>%
+  group_by(agency_name) %>%
+  summarize(avg_population=mean(population),
+            avg_black_population=mean(black_population),
+            avg_pct_black_pop=mean(pct_black),
+            avg_total_cases=mean(total_cases_by_agency),
+            avg_black_cases=mean(overall_black_cases),
+            avg_pct_black_cases=mean(pct_race_black),
+            avg_black_dismissed_cases_pct=mean(pct_black_dismissed_cases)) %>%
+  filter(avg_total_cases >= 10)
+
+### find disparities between the pct of a community the police agency represents that is black vs the pct of the drug cases where the defendants are black 
+race_disparities_by_dept <- pct_black_avg %>%
+  select(agency_name,avg_total_cases,avg_pct_black_pop, avg_pct_black_cases) %>%
+  mutate(racial_disparity=(avg_pct_black_cases-avg_pct_black_pop)) %>%
+  arrange(-racial_disparity)
+
+## separate this into suburbs and city
+
+chicago_race_disparities <- race_disparities_by_dept %>%
+  filter(agency_name %in% CPD_district_identifier) %>%
+  arrange(-racial_disparity) %>%
+  top_n(15)
+
+suburban_cook_race_disparities <- race_disparities_by_dept %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-racial_disparity) %>%
+  top_n(15)
+
+
+```
+
+Our data analysis shows that black defendants represent `r pct_of_all_cases_black` % of all possession charges despite representing 23.8 % of Cook County. Approximately `r black_dismissed_pct` % of possession cases against black people are dismissed in preliminary hearings, versus `r white_dismissed_pct` % of all possession cases against white dependents.
+
+Here are the top 15 Chicago police districts with the highest disparities between black population and black people arrested for possession charges from from 2010 to 2018. Racial disparity is calculated by taking average black population of a district or a municipality and subtracting that from the average percent of possession cases with black defendants. For example, nine percent of District 18 is black but 75 percent of the possession cases were for black defendants.
+
+```{r, results ='asis'}
+kable(chicago_race_disparities, caption="racial disparities in possession arrests in chicago")
+```
+Likewise, these are the top 15 suburban police departments with the highest disparities between black population and black people arrested for possession charges from 2010 to 2018.
+
+```{r, results='asis'}
+kable(suburban_cook_race_disparities,caption="racial disparities in possession arrests in suburban cook county")
+```
+## Per capita rates for possession charges by race
+
+To get a better understanding of these possession charges by race, let's examine how police agencies compare against one another on a per capita basis.
+
+```{r}
+
+per_capita_by_race <- black_arrest_and_census_data %>%
+  group_by(year,agency_name) %>%
+  mutate(other_population=(population-black_population),other_cases=(total_cases_by_agency-overall_black_cases)) %>%
+  group_by(agency_name) %>%
+  summarize(avg_population=mean(population),
+            avg_other_cases=mean(other_cases),
+            avg_black_population=mean(black_population),
+            avg_black_cases=mean(overall_black_cases),
+            avg_other_population=mean(other_population),
+            avg_total_cases=mean(total_cases_by_agency)) %>%
+  filter(avg_total_cases > 10) %>%
+  group_by(agency_name) %>%
+  summarize(per_capita_black_charges=((avg_black_cases/avg_black_population)*100000),
+            per_capita_other_charges=((avg_other_cases/avg_other_population)*100000),
+            avg_black_population,avg_other_population)
+
+
+
+
+suburban_race_per_capita <- per_capita_by_race %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-per_capita_black_charges) %>%
+  top_n(15) %>%
+  select(agency=agency_name,per_cap_black_charges=per_capita_black_charges,per_cap_other_charges=per_capita_other_charges,avg_black_pop=avg_black_population,avg_other_pop=avg_other_population)
+
+chicago_race_per_capita <- per_capita_by_race %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  arrange(-per_capita_black_charges) %>%
+  top_n(15) %>%
+  select(agency=agency_name,per_cap_black_charges=per_capita_black_charges,per_cap_other_charges=per_capita_other_charges,avg_black_pop=avg_black_population,avg_other_pop=avg_other_population)
+
+```
+
+The top 15 Chicago districts with the highest number of possession charges per capita for black people: 
+
+```{r,results='asis'}
+kable(chicago_race_per_capita,caption='chicago district possession charges per capita by race')
+
+```
+
+The top 15 suburban departments with the highest number of possession charges per capita for black people: 
+
+```{r,results='asis'}
+kable(suburban_race_per_capita,caption='suburban possession charges per capita by race')
+
+```
+
+
+## Individual police officers
+
+Now that the case dismissal rate has been calculated for police departments, let's see if any individual police officers stick out.
+
+First, let's get a handle on the number of police officers, who are identified by their star number in the database.
+
+```{sql connection=con, output.var="star_counts", echo=FALSE, cache = TRUE}
+SELECT COUNT(star) FROM raw_mcase WHERE star is NOT NULL;
+```
+
+```{sql connection=con, output.var="star_counts_distinct", echo=FALSE, cache = TRUE}
+SELECT COUNT(DISTINCT star) FROM raw_mcase WHERE star is NOT NULL
+```
+
+There are `r star_counts` star numbers and `r star_counts_distinct` distinct star numbers. This could mean a few things: the data is bad, the same officers are using the same star number to enter in charges, or a tiny fraction of all police officers are responsible for entering charges into the system.
+
+Now let's do a similar count of star numbers, but just for possession charges from 2010 to 2018. This will drastically reduce the size of the universe of police officers.
+
+```{sql connection=con, output.var="star_counts_controlled_substance", echo=FALSE, cache = TRUE}
+
+SELECT COUNT(star) AS star_count, COUNT(DISTINCT star) AS distinct_star_count, SUM(CASE WHEN star IS NULL THEN 1 END) as null_counts, COUNT(drug_cases.case_number) AS case_count
+FROM (SELECT amdc.case_number, star
+      FROM ctoner.all_municipal_drug_cases amdc
+      JOIN raw_mcase USING (case_number)
+      WHERE year between 2010 and 2018) as drug_cases
+      
+```
+
+```{r}
+total_stars <- star_counts_controlled_substance$star_count
+total_distinct_stars <- star_counts_controlled_substance$distinct_star_count
+star_pct <- ((total_distinct_stars / total_stars)*100)
+null_counts <- star_counts_controlled_substance$null_counts
+case_count <- star_counts_controlled_substance$case_count
+null_pct <- ((null_counts / case_count)*100)
+```
+
+For these, there are `r total_stars` total stars, `r total_distinct_stars` or `r star_pct` %, of those are distinct. There are `r null_counts` controlled substance charges with no star number identified, or about `r null_pct` % of all possession of a controlled substance charges.
+
+```{sql connection=con, output.var="case_dismissed_rates_by_officer", echo=FALSE, cache = TRUE}
+SELECT mdcpr.agency_name, star, COUNT(DISTINCT mdcpr.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases
+      FROM ctoner.municipal_drug_cases_police_race mdcpr
+      JOIN raw_mcase USING (case_number)
+      LEFT JOIN (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn
+                 FROM docket_event de
+                 JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+                 JOIN disposition_codes dc ON dc.code = de.disposition_code
+                 WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events ON case_number = events.max_cn
+                 WHERE year between 2010 and 2018 AND star IS NOT NULL
+GROUP BY mdcpr.agency_name, star
+;
+```
+
+```{r}
+#chicago police caseloads
+case_dismissed_rates_by_officer_pct <- case_dismissed_rates_by_officer %>%
+  select(agency_name,star,dismissed_cases,overall_drug_cases) %>%
+  mutate(pct_dismissed=((dismissed_cases/overall_drug_cases)*100)) %>%
+  filter(overall_drug_cases > 50) %>%
+  arrange(-pct_dismissed)
+
+#suburban police caseloads
+case_dismissed_rates_by_officer_pct_sub <- case_dismissed_rates_by_officer %>%
+  select(agency_name,star,dismissed_cases,overall_drug_cases) %>%
+  mutate(pct_dismissed=((dismissed_cases/overall_drug_cases)*100)) %>%
+  filter(overall_drug_cases >= 15) %>%
+  arrange(-pct_dismissed)
+
+#cicero police caseloads
+case_dismissed_rates_by_officer_pct_cicero <- case_dismissed_rates_by_officer %>%
+  select(agency_name,star,dismissed_cases,overall_drug_cases) %>%
+  mutate(pct_dismissed=((dismissed_cases/overall_drug_cases)*100)) %>%
+  filter(overall_drug_cases >= 20,agency_name == "CICERO") %>%
+  arrange(-pct_dismissed)
+
+#only chicago police
+chicago_dismissed_rates_by_officer <- case_dismissed_rates_by_officer_pct %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) %>%
+  top_n(10)
+
+#only chicago police without grouping by district name
+
+chicago_non_grouping <- case_dismissed_rates_by_officer %>%
+  filter(agency_name %in% c(CPD_district_identifier, c("CHICAGO"))) 
+
+chicago_pd_non_grouped <- chicago_non_grouping %>%
+  select(star,overall_drug_cases,dismissed_cases) %>%
+  group_by(star) %>%
+  summarize(overall_drug_cases=sum(overall_drug_cases),dismissed_cases=sum(dismissed_cases)) %>%
+  mutate(dismissal_pct=((dismissed_cases/overall_drug_cases)*100)) %>%
+  filter(overall_drug_cases >= 50) %>% 
+  arrange(-dismissal_pct) %>% 
+  top_n(10)
+  
+
+
+#only cicero police
+cicero_dismissed_rates_by_officer <- case_dismissed_rates_by_officer_pct_cicero %>% top_n(10)
+
+#only suburban police sans cicero
+suburban_dismissed_rates_by_officer_no_cicero <- case_dismissed_rates_by_officer_pct_sub %>%
+  filter(!agency_name %in% c(CPD_district_identifier, c("CHICAGO","CICERO"))) %>%
+  top_n(25)
+
+
+```
+
+For all Chicago officers with more than 50 drug arrests from 2010 to 2018, these officers have the highest percentages of dismissed cases.
+
+```{r, results='asis'}
+kable(chicago_dismissed_rates_by_officer,caption="Chicago cops with the highest drug charge dismissal rates")
+```
+
+For all Chicago officers with more than 50 drug arrests from 2010 to 2018, these officers have the highest percentages of dismissed cases without grouping them by the districts they entered into the court data.
+
+```{r, results='asis'}
+kable(chicago_pd_non_grouped,caption="Chicago police with the highest dismissal rates, ungroupd by district")
+```
+
+
+
+For all suburban officers with 15 or more drug arrests from 2010 to 2018, these officers have the highest percentages of dismissed cases.
+
+```{r, results='asis'}
+kable(suburban_dismissed_rates_by_officer_no_cicero,caption="Suburban cops with the highest drug charge dismissal rates")
+```
+
+For all Cicero officers with 20 or more drug arrests from 2010 to 2018, these officers have the highest percentages of dismissed cases.
+
+```{r, results='asis'}
+kable(cicero_dismissed_rates_by_officer,caption="Cicero cops with the highest drug charge dismissal rates")
+```
+
+
+
+## Most targeted single defendants
+
+Another interesting story angle is the "conveyor belt" angle of drug crimes. Meaning, taking a look at defendants who cycle in and out of the system repeatedly. This analysis shows the single defendants who have been charged with posssesion of a controlled substance the most in municipal court from 2010 to 2018.
+
+```{sql connection=con, output.var="possession_dismissed_rates_by_defendant", echo=FALSE, cache = TRUE}
+SELECT ir_number, COUNT(DISTINCT amdc.case_number) AS overall_drug_cases, COUNT(DISTINCT max_cn) AS dismissed_cases 
+FROM (SELECT DISTINCT ON(dc.description, max_date, max_cn) max_cn, max_date, dc.description, central_booking_1, central_booking_2, year
+      FROM docket_event de
+      JOIN ctoner.non_continued_drug_cases ncdc ON ncdc.max_cn = de.case_number AND ncdc.max_date = de.date
+      JOIN court_case cc ON de.case_number = cc.case_number
+      JOIN disposition_codes dc ON dc.code = de.disposition_code
+      WHERE dc.description IN('NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI')) as events
+RIGHT JOIN ctoner.all_municipal_drug_cases amdc ON events.max_cn = amdc.case_number
+JOIN raw_mcase USING (case_number)
+WHERE amdc.year between 2010 and 2018 AND ir_number IS NOT NULL
+GROUP BY ir_number
+ORDER BY overall_drug_cases desc
+```
+
+```{r, results = 'asis'}
+defendant_rates <- possession_dismissed_rates_by_defendant %>%
+  select(overall_drug_cases) %>%
+  group_by(overall_drug_cases) %>%
+  summarize(count=n()) %>%
+  mutate(total_cases=sum(count)) %>%
+  mutate(pct_count=((count/total_cases)*100))
+
+majority_single_case <- defendant_rates$pct_count[1]
+
+majority_single_case <- round(majority_single_case,digits=2)
+
+defendant_rates <- defendant_rates %>% select(cases=overall_drug_cases,count,pct_count)
+
+kable(defendant_rates,caption="separate drug cases per defendant")
+
+```
+A vast majority of defendants, `r majority_single_case` % of all defendants in drug cases, appeared once in eight years.
+
+## Remaining questions, methodology concerns
+
+Our data uses three Chicago police divisions that are no longer divisions: 23,21,13. Thus, there are no population totals for those divisions. Similarly, there CHICAGO is listed as a police agency distinct from the Chicago police divisions that are identified so we will need to deal with that. How do we categorize those cases? Should we just use the division data as a guidepost and indicate it as such?
+
+Cook County also is listed as an agency and it's unclear how to adjust for per capita based the sheriff's office, who work in unincorporated areas but also assist with a number of other incorporated matters.
+
+These queries are operating under the assumption that the cases are tossed out at the municipal division level if the events of 'NON-SUIT','FINDING NO PROB CAUSE - DISMSD', 'STRICKEN OFF - LEAVE REINSTATE', 'NOLLE PROSEQUI' appear in the final date of a municipal division. This will need to be double checked and refined.
+
+For the agencies where there is a high dismissal rate or extraordinary high per capita rate, we will need to identify the race of the defendants.
+
+It would also be wise to calculate other rates of felony cases that are dismissed from municipal division.
+
+Finally, we should use the State's Attorney's data to check our assumptions.
+
+## Appendix: Additional code for this report
+
+To reduce the cost of queries needed for this report, I created four virtual tables to identify possession cases. The first identifies case numbers and years for all cases filed in municipal division where possession of a controlled substance is the top charge
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.all_municipal_drug_cases AS SELECT DISTINCT ON(case_number) case_number, year
+          FROM court_case cc
+          JOIN docket_charge using (case_number)
+          JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+          JOIN ucr on ucr_id = ucr.id
+          WHERE division = 'municipal' AND year between 2000 and 2018 and ucr.description = 'Possession of Controlled Substance' and docket_charge.count = '001';
+```
+
+The second virtual table identifies cases that proceed to criminal division. Some of these cases may have been filed directly into criminal division through grand jury indictments, but most of them were first municipal cases.
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.proceeding_drug_cases AS SELECT DISTINCT ON(case_number) case_number, cc.year, r.central_booking_1
+                      FROM raw_mcase r
+                      JOIN court_case cc USING (case_number)
+                      JOIN docket_charge using (case_number)
+                      JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+                      JOIN ucr on ucr_id = ucr.id
+                      WHERE division = 'criminal' AND cc.year between 2000 and 2018 and ucr.description = 'Possession of # Controlled Substance' and docket_charge.count = '001';
+```
+
+The third virtual table identifies cases that were filed in municipal division, but did not proceed to felony division to the best of our knowledge.
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.non_continued_drug_cases AS SELECT MAX(de.date) as max_date, case_number AS max_cn, central_booking_1, central_booking_2
+            FROM docket_event de
+            JOIN raw_mcase USING (case_number)
+            JOIN court_case cc USING (case_number)
+            JOIN disposition_codes dc ON dc.code = de.disposition_code
+            JOIN docket_charge using (case_number)
+            JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+            JOIN ucr on ucr_id = ucr.id
+            WHERE division = 'municipal' AND year between 2000 and 2018 and ucr.description = 'Possession of Controlled Substance' AND docket_charge.count = '001'
+            GROUP BY case_number, central_booking_1, central_booking_2
+            HAVING NOT BOOL_OR(dc.description IN('SUPERSEDED BY DIRECT INDTMENT','TRANSFERRED TO CRIMINAL DIV','FINDING OF GUILTY','PLEA OF GUILTY','SUPERSEDED BY INFORMATION','FNDG PROB CAUSE'))
+```
+
+The fourth virtual table reclassifies Chicago police departments and suburban departments, and identifies defendants as "black" or "other"
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.municipal_drug_cases_police_race AS SELECT DISTINCT ON(case_number) case_number, year,
+             CASE WHEN race = 'B' THEN 'black', WHEN race IS NULL then 'null' ELSE 'other' END AS race_cat, 
+                       CASE WHEN agency_name = 'CHICAGO(10TH) MARQU' THEN '10'
+                       WHEN agency_name = 'CHICAGO(11TH) FILLM' THEN '11'
+                       WHEN agency_name = 'CHICAGO(12TH) MONRO' Then '12'
+                      WHEN agency_name = 'CHICAGO(13TH) WOOD' THEN '13'
+                       WHEN agency_name = 'CHICAGO(14TH) SHAKE' THEN '14'
+                       WHEN agency_name = 'CHICAGO(15TH) AUSTI' THEN '15'
+                       WHEN agency_name = 'CHICAGO(16TH) IRVIN' THEN '16'
+                       WHEN agency_name = 'CHICAGO(17TH) ALBAN' THEN '17'
+                      WHEN agency_name = 'CHICAGO(18TH) EAST' THEN '18'
+                       WHEN agency_name = 'CHICAGO(19TH) TOWN' THEN '19'
+                       WHEN agency_name = 'CHICAGO(1ST) CENTRA' THEN '1'
+                       WHEN agency_name = 'CHICAGO(20TH) SUMME' THEN '20'
+                       WHEN agency_name = 'CHICAGO(21ST) PRAIR' THEN '21'
+                       WHEN agency_name = 'CHICAGO (22ND) DIST' THEN '22'
+                       WHEN agency_name = 'CHICAGO (23RD) DIST' THEN '23'
+                       WHEN agency_name = 'CHICAGO (24) DIST 2' THEN '24'
+                       WHEN agency_name = 'CHICAGO (25TH) DIST' THEN '25'
+                       WHEN agency_name = 'CHICAGO(2ND) WABASH' THEN '2'
+                       WHEN agency_name = 'CHICAGO(3RD) GRAND' THEN '3'
+                       WHEN agency_name = 'CHICAGO(4TH) SOUTH' THEN '4'
+                       WHEN agency_name = 'CHICAGO(5TH) KENSIN' THEN '5'
+                       WHEN agency_name = 'CHICAGO(6TH) GRESHA' THEN '6'
+                       WHEN agency_name = 'CHICAGO(7TH) ENGLEW' THEN '7'
+                       WHEN agency_name = 'CHICAGO(8TH) CHICAG' THEN '8'
+                       WHEN agency_name = 'CHICAGO(9TH) DEERIN' THEN '9'
+                       WHEN agency_name IN (
+                       'CHICAGO POLICE DEPT',
+                       'VICE CONTROL SECTIO',
+                       'GANG CRIMES NORTH',
+                       'NARCOTICS SECTION',
+                      'GANG CRIMES SOUTH',
+                      'GANG CRIMES WEST',
+                       'PUBLIC HOUSING NORT',
+                       'PUBLIC TRANS SECTIO',
+                       'PUBLIC HOUSING SOUT')
+                       THEN 'CHICAGO'
+                       WHEN agency_name = 'OAK FOREST PD' THEN 'OAK FOREST'
+                       WHEN agency_name = 'SOUTH CHICAGO HEIGH' THEN 'SOUTH CHICAGO HEIGHTS'
+                       WHEN agency_name = 'EAST HAZELCREST' THEN 'EAST HAZEL CREST'
+                       WHEN agency_name = 'HAZELCREST' THEN 'HAZEL CREST'
+                       WHEN agency_name = 'LAGRANGE' THEN 'LA GRANGE'
+                       WHEN agency_name = 'LAGRANGE PARK' THEN 'LA GRANGE PARK'
+                       ELSE agency_name
+                       END AS agency_name
+      FROM raw_mcase
+      JOIN court_case cc USING (case_number)
+      JOIN docket_charge using (case_number)
+      JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+      JOIN ucr on ucr_id = ucr.id
+      WHERE division = 'municipal' AND year between 2000 and 2018 and ucr.description = 'Possession of Controlled Substance' and docket_charge.count = '001') as drug_cases
+```
+
+Table that shows race for possession charges
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.municipal_drug_charge_race_table AS SELECT ct.year, ct.case_number, 
+    CASE WHEN dt.race_mode = 'Black' or ccoms_race = 'Black' THEN 'Black'
+    WHEN dt.race_mode = 'White' or ccoms_race = 'White' THEN 'White'
+    WHEN dt.race_mode = 'Asian/Native' Then 'Asian/Native'
+    ELSE 'Other'
+End as race, 
+    CASE WHEN dt.ethnicity_mode = 'Latinx' or ccoms_latinx = 'Latinx' THEN 'Latinx'
+    WHEN dt.race_mode = 'Not' or ccoms_race = 'Not' THEN 'Not'
+ELSE 'Not'
+End as ethnicity
+From ctoner.all_municipal_drug_cases ct
+    RIGHT JOIN ir_cluster c ON ct.case_number = c.case_number
+    JOIN defendant_table1 dt USING (cluster_id)
+    JOIN docket_charge d ON ( d.case_number = ct.case_number )
+    WHERE ct.year between 2000 and 2018
+    GROUP BY ct.year, ct.case_number, c.cluster_id, dt.race_mode, dt.ethnicity_mode, dt.ccoms_race, dt.ccoms_latinx;
+
+    
+```
+
+This table identifies all Unlawful Use of a Weapon charges filed in municipal division between 2000 and 2018.
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.agg_unlawful_weapon_charges AS SELECT DISTINCT ON(case_number) case_number, year
+      FROM court_case cc
+      JOIN docket_charge using (case_number)
+      JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+      JOIN ucr on ucr_id = ucr.id
+      WHERE division = 'municipal' AND year between 2000 and 2018 and ucr.description = 'Unlawful Use of Weapon' and docket_charge.count = '001'
+```
+
+
+This code generates a table from the Cook County State's Attorney's [case initiation data](https://datacatalog.cookcountyil.gov/Courts/Initiation/7mck-ehwz) to show all PSC cases filed in Cook County since 2011.
+
+```{sql connection=con, eval=FALSE}
+SELECT extract(year from incident_begin_date) AS year, COUNT(case_id)
+                      FROM sa_initiation
+                      WHERE offense_category = 'Narcotics' AND charge_offense_title = 'POSSESSION OF A CONTROLLED SUBSTANCE' AND charge_count = '1' AND extract(year from incident_begin_date) between '2011' AND '2020'
+                      GROUP BY year
+                     ORDER BY year DESC;
+```
+
+Table showing all drug possession charges in Chicago
+
+```{sql connection=con}
+CREATE TABLE ctoner.chicago_drug_charges AS SELECT amdc.case_number, year
+      FROM all_municipal_drug_cases amdc
+      JOIN raw_mcase USING (case_number)
+      WHERE agency_name IN (
+      'CHICAGO(10TH) MARQU',
+      'CHICAGO(11TH) FILLM',
+      'CHICAGO(12TH) MONRO',
+      'CHICAGO(13TH) WOOD',
+      'CHICAGO(14TH) SHAKE',
+      'CHICAGO(15TH) AUSTI',
+      'CHICAGO(16TH) IRVIN',
+      'CHICAGO(17TH) ALBAN',
+      'CHICAGO(18TH) EAST',
+      'CHICAGO(19TH) TOWN',
+      'CHICAGO(1ST) CENTRA',
+      'CHICAGO(20TH) SUMME',
+      'CHICAGO(21ST) PRAIR',
+      'CHICAGO (22ND) DIST',
+      'CHICAGO (23RD) DIST',
+      'CHICAGO (24) DIST 2',
+      'CHICAGO (25TH) DIST',
+      'CHICAGO(2ND) WABASH',
+      'CHICAGO(3RD) GRAND',
+      'CHICAGO(4TH) SOUTH',
+      'CHICAGO(5TH) KENSIN',
+      'CHICAGO(6TH) GRESHA',
+      'CHICAGO(7TH) ENGLEW',
+      'CHICAGO(8TH) CHICAG',
+      'CHICAGO(9TH) DEERIN',
+      'CHICAGO POLICE DEPT',
+      'VICE CONTROL SECTIO',
+      'GANG CRIMES NORTH',
+      'NARCOTICS SECTION',
+      'GANG CRIMES SOUTH',
+      'GANG CRIMES WEST',
+      'PUBLIC HOUSING NORT',
+      'PUBLIC TRANS SECTIO',
+      'PUBLIC HOUSING SOUT')
+      ORDER BY year DESC;
+```
+

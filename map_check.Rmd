@@ -1,0 +1,387 @@
+---
+title: "analysis-map-check"
+author: "Casey Toner"
+date: "AUTOFILL"
+output: pdf_document
+font_adjustment: +1
+always_allow_html: yes 
+---
+
+```{r, echo = FALSE, message = FALSE}
+library(RPostgreSQL)
+library(knitr)
+options(scipen=999,digits=2)
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, max.print = -1)
+# if we are in the reports directory, we are probably running
+# RStudio. Get the environmental settings. If we aren't, we are doing
+# something unusual and don't guess what to do.
+if (endsWith(getwd(), 'reports')) {
+    dotenv::load_dot_env('../.env')
+    }
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv,
+                     dbname="court_terminal",
+                 port="9000",
+                 host="localhost",
+                 user=Sys.getenv("PGUSER"),
+                 password=Sys.getenv("PGPASSWORD"))
+
+library(dplyr)
+library(tidyr)
+library(tidyverse) 
+library(ggplot2)
+library(lubridate)
+library(ggmap)
+library(tidygeocoder)
+library(mapview)
+library(readr)
+library(sf)
+library(viridis)
+library(raster)
+
+```
+
+
+#maps
+
+I created a handful of maps to illustrate our drug charge findings using [CPD data](https://gitlab.com/court-transparency-project/chicago-arrests). The first map shows where all arrests occurred using the CPD arrest portal. 
+
+I used this database to geocode the data. I worked on this process with Forest and will spare you the details.
+
+```{r message = FALSE, warning = FALSE}
+geocoded_addresses <- read_csv('~/court_analysis/analysis-drug_data_check/reports/map_data/csv_files/geocoded_psc_arrests.csv')
+
+colnames(geocoded_addresses) <- c("address","district","beat","lon","lat","geocoded_address")
+```
+
+```{r message = FALSE, warning = FALSE}
+cpd_map_data <- read_csv('~/court_analysis/analysis-drug_data_check/reports/map_data/csv_files/cpd_map_data.csv')
+cpd_map_data$beat <- as.character(cpd_map_data$beat)
+cpd_map_data$year <- as.character(cpd_map_data$year)
+cpd_map_data$district <- as.character(cpd_map_data$district)
+```
+
+```{r message = FALSE, warning = FALSE}
+total_charges_beat_district <- read_csv('~/court_analysis/analysis-drug_data_check/reports/map_data/csv_files/total_charges_beat_district.csv')
+total_charges_beat_district$beat <- as.character(total_charges_beat_district$beat)
+total_charges_beat_district$year <- as.character(total_charges_beat_district$year)
+total_charges_beat_district$district <- as.character(total_charges_beat_district$district)
+
+```
+
+
+```{r}
+
+cpd_psc_arrests <- cpd_map_data %>%
+  unite(address, c("street_no","street_dir","street_name","city"),sep=" ") %>% inner_join(total_charges_beat_district,by=c("year","beat","district"))
+
+pcs_cases_map <- geocoded_addresses %>%
+  inner_join(cpd_psc_arrests,by=c("address")) %>% 
+ dplyr::select(year,address,district=district.x,beat=beat.x,lon,lat,total_beat_crimes_per_year) %>% 
+  group_by(beat,year) %>%
+  mutate(psc_beat_totals=n()) %>% 
+  dplyr::select(year,address,district,beat,lon,lat,psc_beat_totals,total_beat_crimes_per_year) %>% 
+  mutate(pct_psc_charges_by_beat=(psc_beat_totals/total_beat_crimes_per_year)*100)
+```
+
+Now, we need to properly format our data, while removing a couple of outlier lats and logs in Michigan and Wisconsin.
+
+```{r message = FALSE, warning = FALSE}
+pcs_cases <- pcs_cases_map %>%
+  filter(!is.na(lat), !is.na(lon), address != "530 W STONEGATE CIRCLE , Chicago, IL", address != "6400 W I 290 , Chicago, IL") %>%
+  mutate(district=as.character(district))
+
+pcs_cases <- as_tibble(pcs_cases)
+
+pcs_cases_sf <- st_as_sf(pcs_cases,coords = c("lon","lat"), crs=4326)
+
+```
+
+I imported shape files of [Chicago police districts](https://data.cityofchicago.org/Public-Safety/Boundaries-Police-Districts-current-/fthy-xz3r) and [Chicago police beats](https://data.cityofchicago.org/Public-Safety/Boundaries-Police-Beats-current-/aerh-rz74). And created objects out of them. These are also uploaded to my [repository](https://gitlab.com/court-transparency-project/analysis-drug-charges/-/tree/master/shapefiles)
+
+```{r message = FALSE, warning = FALSE}
+chicago_map_shape <- st_read("~/court_analysis/analysis-drug_data_check/reports/map_data/shape_files/Boundaries - City/")
+chicago_pd_map <- st_read("~/court_analysis/analysis-drug_data_check/reports/map_data/shape_files/Boundaries - Police Districts (current)/")
+chicago_pd_beat_map <- st_read("~/court_analysis/analysis-drug_data_check/reports/map_data/shape_files/police_beat_files/")
+chicago_streets_map <- st_read("~/court_analysis/analysis-drug_data_check/reports/map_data/shape_files/Street Center Lines/")
+chicago_neighborhoods <- st_read("~/court_analysis/analysis-drug_data_check/reports/map_data/shape_files/Boundaries - Neighborhoods/")
+
+chicago_pd_beats <- chicago_pd_beat_map["beat"]
+chicago_pd_boundaries <- chicago_pd_map["dist_num"]
+chicago_boundaries <- chicago_map_shape["shape_area"]
+```
+
+```{r}
+chi_highways <- chicago_streets_map %>% filter(class == 1 )
+
+chi_arterials <- chicago_streets_map %>% filter(class == 2)
+
+chi_highways <- chi_highways["class"]
+
+chi_arterials <- chi_arterials["class"]
+
+chi_neighborhoods <- chicago_neighborhoods["pri_neigh"]
+```
+
+
+## Stark Black and White Google Map showing all drug possession charges
+
+```{r}
+#clear the google map off and create a map using a clean black and white filter
+
+s <- "element:geometry%7Ccolor:0xf5f5f5&style=element:labels%7Cvisibility:off&style=element:labels.icon%7Cvisibility:off&style=element:labels.text.fill%7Ccolor:0x616161&style=element:labels.text.stroke%7Ccolor:0xf5f5f5&style=feature:administrative%7Celement:geometry%7Cvisibility:off&style=feature:administrative.country%7Celement:geometry.stroke%7Ccolor:0x000000%7Cvisibility:on&style=feature:administrative.land_parcel%7Cvisibility:off&style=feature:administrative.land_parcel%7Celement:labels.text.fill%7Ccolor:0xbdbdbd&style=feature:administrative.neighborhood%7Cvisibility:off&style=feature:poi%7Cvisibility:off&style=feature:poi%7Celement:geometry%7Ccolor:0xeeeeee&style=feature:poi%7Celement:labels.text.fill%7Ccolor:0x757575&style=feature:poi.park%7Celement:geometry%7Ccolor:0xe5e5e5&style=feature:poi.park%7Celement:labels.text.fill%7Ccolor:0x9e9e9e&style=feature:road%7Cvisibility:off&style=feature:road%7Celement:geometry%7Ccolor:0xffffff&style=feature:road%7Celement:labels.icon%7Cvisibility:off&style=feature:road.arterial%7Celement:labels.text.fill%7Ccolor:0x757575&style=feature:road.highway%7Celement:geometry%7Ccolor:0xdadada&style=feature:road.highway%7Celement:labels.text.fill%7Ccolor:0x616161&style=feature:road.local%7Celement:labels.text.fill%7Ccolor:0x9e9e9e&style=feature:transit%7Cvisibility:off&style=feature:transit.line%7Celement:geometry%7Ccolor:0xe5e5e5&style=feature:transit.station%7Celement:geometry%7Ccolor:0xeeeeee&style=feature:water%7Celement:geometry%7Ccolor:0xc9c9c9&style=feature:water%7Celement:labels.text.fill%7Ccolor:0x9e9e9e&size=480x360"
+
+chicago_map <- get_googlemap(center = c(-87.6,41.9), scale=4, maptype="terrain",color = "color", zoom=10, style=s)
+
+```
+
+Create stark of map of all geocoded PCS arrests using PCS information and maps
+
+```{r}
+
+all_pcs_map <- ggmap(chicago_map) +
+  geom_sf(data = chicago_pd_boundaries, inherit.aes = FALSE, fill=NA,col="red") +
+  geom_point(data=pcs_cases, size=.3, aes(x = lon, y = lat, alpha = 1/7000, stroke=0)) +
+  theme_void() + theme(legend.position = "none")
+
+
+all_pcs_map
+```
+
+We created heat maps showing the percentage of drug arrests in each beat and total PCS arrests by district, and then a map showing total shootings by beat throughout Chicago. As you'll see, the drug map looks different than the total shootings map, which is the classic Chicago map used to demonstrate inequities.
+
+Here's the [shooting data.](https://gitlab.com/court-transparency-project/analysis-drug-charges/-/blob/master/reports/shooting_data.csv)
+
+```{r message = FALSE, warning = FALSE}
+shootings_data <- read_csv("~/court_analysis/analysis-drug-charges/reports/shooting_data.csv")
+```
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+
+iso_shootings_cases <- shootings_data %>%
+  filter(!is.na(latitude))
+
+cpd_shootings_by_beat <- iso_shootings_cases %>%
+  st_as_sf(coords=c("longitude","latitude"),crs="+proj=longlat") %>% 
+  st_transform(crs=st_crs(chicago_pd_beats))
+```
+
+```{r message = FALSE, warning = FALSE, echo = FALSE}
+shootings_points_in <- st_join(chicago_pd_beats, cpd_shootings_by_beat, left=T)
+```
+
+```{r}
+shootings_by_beat <- shootings_points_in %>% 
+  dplyr::select(year,district,beat=beat.y,location,geometry)
+
+shootings_by_beat <- shootings_by_beat %>%
+  group_by(beat) %>% 
+  summarize(total_shootings_by_beat=n())
+  
+```
+
+
+```{r}
+shooting_map <- ggplot(shootings_by_beat) +
+  geom_sf(aes(fill=total_shootings_by_beat),color=NA) +
+  coord_sf(datum=NA) +
+  labs(title = "Shootings by police beat",
+       subtitle = "From 2014 to 2021",
+       caption = "Source: Chicago Police Department",
+       fill = "total_shootings_by_beat") +
+    geom_sf(data = chi_highways,
+          inherit.aes = FALSE,
+          color = "black",
+          size=.8) + 
+    geom_sf(data = chi_neighborhoods,
+          inherit.aes = FALSE,
+          fill=NA,
+          size=.2) + 
+  scale_fill_viridis(option="mako", direction=-1) +
+  theme_void()
+
+shooting_map
+```
+
+## Possession arrests as a percentage of a police beat's overall arrests
+
+This next map shows the percentage arrests in a particular police beat that are for drug possession.
+
+
+```{r, warning = FALSE,message = FALSE}
+iso_pcs_cases <- pcs_cases %>%
+  dplyr::select(year,district,beat,pct_psc_charges_by_beat,lat,lon) %>%
+  filter(!is.na(district))
+
+## since the percent of arrests per beat is the same for each beat per year, I'm grouping and slicing by year and beat. this way the size of the object shrinks from 40k rows to 2k rows (one row each for each beat and year)
+
+iso_pcs_cases_by_beat <- iso_pcs_cases %>% group_by(year,beat) %>% slice(1)
+  
+```
+
+
+```{r message = FALSE, warning = FALSE}
+cpd_beat_pcs_boundaries <- iso_pcs_cases_by_beat %>%
+  st_as_sf(coords=c("lon","lat"),crs="+proj=longlat") %>% 
+  st_transform(crs=st_crs(chicago_pd_beats))
+```
+
+```{r message = FALSE, warning = FALSE}
+beats_points_in <- st_join(chicago_pd_beats, cpd_beat_pcs_boundaries, left=T)
+```
+
+```{r}
+  by_beat <- beats_points_in %>% 
+    filter(!is.na(year)) %>% 
+  dplyr::select(year,beat=beat.y,pct_psc_charges_by_beat) %>% 
+  group_by(beat) %>% 
+  summarize(total=mean(pct_psc_charges_by_beat))
+
+```
+
+```{r}
+
+pcs_pct_map <- ggplot(by_beat) +
+  geom_sf(aes(fill=total),color=NA) +
+  coord_sf(datum=NA) +
+  labs(title = "Drug possession charges as a percent of charges per police beat",
+       subtitle = "From 2014 to 2021",
+       caption = "Source: Chicago Police Department",
+       fill = "Average percent") +
+  scale_fill_viridis(option="mako", direction=-1) +
+  geom_sf(data = chi_highways,
+          inherit.aes = FALSE,
+          color = "black",
+          size=.8) + 
+    geom_sf(data = chi_neighborhoods,
+          inherit.aes = FALSE,
+          fill=NA,
+          size=.2) + 
+  theme_void()
+
+pcs_pct_map
+
+```
+
+#create PNGS of maps
+
+PCS as a pct of arrest beat map
+
+```{r}
+
+# Open a pdf file
+png("~/court_analysis/analysis-drug_data_check/reports/map_data/pngs/pcs_as_pct_of_arrest.png", width = 1000, height = 1000, res = 100) 
+# 2. Create a plot
+ggplot(by_beat) +
+  geom_sf(aes(fill=total),color=NA) +
+  coord_sf(datum=NA) +
+  labs(title = "Drug possession charges as a percent of charges per police beat",
+       subtitle = "From 2014 to 2021",
+       caption = "Source: Chicago Police Department",
+       fill = "Average percent") +
+  scale_fill_viridis(option="mako", direction=-1) +
+  geom_sf(data = chi_highways,
+          inherit.aes = FALSE,
+          color = "black",
+          size=.8) + 
+    geom_sf(data = chi_neighborhoods,
+          inherit.aes = FALSE,
+          fill=NA,
+          size=.2) + 
+  theme_void()
+# Close the pdf file
+dev.off() 
+
+```
+
+All drug charges map
+
+```{r}
+
+# Open a pdf file
+png("~/court_analysis/analysis-drug_data_check/reports/map_data/pngs/all_drug_charges.png", width = 1000, height = 1000, res = 100) 
+# 2. Create a plot
+ ggmap(chicago_map) +
+  geom_sf(data = chicago_pd_boundaries, inherit.aes = FALSE, fill=NA,col="red") +
+  geom_point(data=pcs_cases, size=.3, aes(x = lon, y = lat, alpha = 1/7000, stroke=0)) +
+  theme_void() + theme(legend.position = "none")
+
+# Close the pdf file
+dev.off() 
+```
+
+Shootings map PNG
+
+```{r}
+
+# Open a pdf file
+png("~/court_analysis/analysis-drug_data_check/reports/map_data/pngs/shooting_map.png", width = 1000, height = 1000, res = 100) 
+# 2. Create a plot
+ggplot(shootings_by_beat) +
+  geom_sf(aes(fill=total_shootings_by_beat),color=NA) +
+  coord_sf(datum=NA) +
+  labs(title = "Shootings by police beat",
+       subtitle = "From 2014 to 2021",
+       caption = "Source: Chicago Police Department",
+       fill = "total_shootings_by_beat") +
+    geom_sf(data = chi_highways,
+          inherit.aes = FALSE,
+          color = "black",
+          size=.8) + 
+    geom_sf(data = chi_neighborhoods,
+          inherit.aes = FALSE,
+          fill=NA,
+          size=.2) + 
+  scale_fill_viridis(option="mako", direction=-1) +
+  theme_void()
+# Close the pdf file
+dev.off() 
+
+```
+
+
+
+##unresolved issues
+
+1) There are slight outlines among the police beats in the map that shows possessin of controlled substance arrests as a percent of the overall number of arrests. Not sure how to make them go away. I believe they are related to the Geocoding we did for these arrests.
+
+##Appendix
+
+The first table identifies case numbers and years for all cases filed in municipal division where possession of a controlled substance is the top charge
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE ctoner.all_municipal_drug_cases AS SELECT DISTINCT ON(case_number) case_number, year
+          FROM court_case cc
+          JOIN docket_charge using (case_number)
+          JOIN charge_ucr_lookup on docket_charge.id = docket_charge_id
+          JOIN ucr on ucr_id = ucr.id
+          WHERE division = 'municipal' AND year between 2000 and 2018 and ucr.description = 'Possession of Controlled Substance' and docket_charge.count = '001';
+```
+
+I created this table to isolate shootings, using [Chicago Portal Crime Data](https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2)
+
+```{sql connection=con, eval=FALSE}
+CREATE TABLE chicago_shootings AS SELECT *
+            FROM chicago_crime
+            WHERE primary_type = 'ASSAULT' AND description IN('AGGRAVATED: HANDGUN','AGGRAVATED - HANDGUN','AGGRAVATED: OTHER FIREARM','AGGRAVATED PO: HANDGUN','AGG PRO.EMP: HANDGUN','AGGRAVATED - OTHER FIREARM','AGGRAVATED POLICE OFFICER - HANDGUN','AGG PRO.EMP: OTHER FIREARM','AGGRAVATED PO: OTHER FIREARM','AGGRAVATED PROTECTED EMPLOYEE - HANDGUN','AGGRAVATED POLICE OFFICER - OTHER FIREARM','AGGRAVATED PROTECTED EMPLOYEE - OTHER FIREARM') AND date <= '20210301' AND date >= '20140101';
+```
+
+I then used this query to build the CSV file used in this report.
+
+```{sql connection=con, eval=FALSE, cache = TRUE}
+SELECT EXTRACT(year from date) AS year, district, beat, latitude, longitude, location  FROM chicago_shootings
+```
+
+
+This created the cpd_map_data object using [CPD data](https://gitlab.com/court-tran\dsparency-project/chicago-arrests).
+
+```{sql connection=con, eval=FALSE}
+SELECT EXTRACT(year from arrest_date) AS year, street_no, street_dir, street_name, district, beat FROM cpd_arrests WHERE charge_1_description = 'PCS - POSSESSION - POSS AMT CON SUB EXCEPT (A)(D)';
+```
+
+This created the total_charges_beat_district object using [CPD data](https://gitlab.com/court-transparency-project/chicago-arrests).
+
+```{sql connection=con, eval=FALSE}
+SELECT EXTRACT(year from arrest_date) AS year, district, beat, COUNT(beat) AS total_beat_crimes_per_year FROM cpd_arrests GROUP BY year,district,beat;
+```
+
